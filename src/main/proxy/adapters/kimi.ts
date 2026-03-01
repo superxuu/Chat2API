@@ -6,6 +6,14 @@
 import axios, { AxiosResponse } from 'axios'
 import { Account, Provider } from '../store/types'
 import { PassThrough } from 'stream'
+import { toolsToSystemPrompt, TOOL_WRAP_HINT } from '../utils/tools'
+import { 
+  createToolCallState, 
+  processStreamContent, 
+  flushToolCallBuffer,
+  createBaseChunk,
+  ToolCallState 
+} from '../utils/streamToolHandler'
 
 const KIMI_API_BASE = 'https://www.kimi.com'
 
@@ -34,8 +42,10 @@ interface TokenInfo {
 }
 
 interface KimiMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string | any[]
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string | any[] | null
+  tool_call_id?: string
+  tool_calls?: any[]
 }
 
 interface ChatCompletionRequest {
@@ -45,6 +55,8 @@ interface ChatCompletionRequest {
   temperature?: number
   enableThinking?: boolean
   enableWebSearch?: boolean
+  tools?: any[]
+  tool_choice?: any
 }
 
 const accessTokenMap = new Map<string, TokenInfo>()
@@ -141,35 +153,60 @@ export class KimiAdapter {
     return { accessToken: this.token, userId: '' }
   }
 
-  private messagesPrepare(messages: KimiMessage[]): string {
+  private messagesPrepare(messages: KimiMessage[], toolsPrompt?: string): string {
     let content = ''
 
-    if (messages.length < 2) {
-      content = messages.reduce((acc, msg) => {
+    // Process messages including tool calls and tool responses
+    const processedMessages = messages.map(msg => {
+      // Handle tool calls in assistant message
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const toolCallsText = msg.tool_calls.map(tc => {
+          return `[call:${tc.function.name}]${tc.function.arguments}[/call]`
+        }).join('\n')
+        return { ...msg, content: `[function_calls]\n${toolCallsText}\n[/function_calls]` }
+      }
+      // Handle tool response message
+      if (msg.role === 'tool' && msg.tool_call_id) {
+        return { 
+          ...msg, 
+          role: 'user' as const,
+          content: `[TOOL_RESULT for ${msg.tool_call_id}] ${msg.content || ''}` 
+        }
+      }
+      return msg
+    })
+
+    if (processedMessages.length < 2) {
+      content = processedMessages.reduce((acc, msg) => {
         const text = typeof msg.content === 'string' ? msg.content : ''
         return acc + `${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
     } else {
-      const latestMessage = messages[messages.length - 1]
+      const latestMessage = processedMessages[processedMessages.length - 1]
       const hasFileOrImage = Array.isArray(latestMessage.content) &&
         latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url'].includes(v.type))
 
       if (hasFileOrImage) {
-        messages.splice(messages.length - 1, 0, {
+        processedMessages.splice(processedMessages.length - 1, 0, {
           content: 'Focus on the latest files and messages sent by user',
           role: 'system' as const,
         })
       } else {
-        messages.splice(messages.length - 1, 0, {
+        processedMessages.splice(processedMessages.length - 1, 0, {
           content: 'Focus on the latest message from user',
           role: 'system' as const,
         })
       }
 
-      content = messages.reduce((acc, msg) => {
+      content = processedMessages.reduce((acc, msg) => {
         const text = typeof msg.content === 'string' ? msg.content : ''
         return acc + `${msg.role}:${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
+    }
+
+    // Inject tools prompt at the VERY END of the content to maximize attention
+    if (toolsPrompt) {
+      content = content.trim() + "\n\n" + toolsPrompt
     }
 
     return content
@@ -184,7 +221,18 @@ export class KimiAdapter {
 
   async chatCompletion(request: ChatCompletionRequest): Promise<{ response: AxiosResponse; conversationId: string }> {
     const { accessToken } = await this.acquireToken()
-    const content = this.messagesPrepare(request.messages)
+    
+    // Clone messages to avoid modifying original request
+    const messages = [...request.messages]
+
+    let toolsPrompt = ''
+    // Inject tools definition into prompt if tools are provided
+    if (request.tools && request.tools.length > 0) {
+      // Use simple prompt for Kimi to avoid confusion with prefixes
+      toolsPrompt = toolsToSystemPrompt(request.tools, true)
+    }
+
+    let content = this.messagesPrepare(messages, toolsPrompt)
 
     const enableThinking = request.enableThinking ?? false
     const enableWebSearch = request.enableWebSearch ?? false
@@ -254,11 +302,13 @@ export class KimiStreamHandler {
   private model: string
   private conversationId: string
   private enableThinking: boolean
+  private toolCallState: ToolCallState
 
   constructor(model: string, conversationId: string, enableThinking: boolean = false) {
     this.model = model
     this.conversationId = conversationId
     this.enableThinking = enableThinking
+    this.toolCallState = createToolCallState()
   }
 
   async handleStream(stream: any): Promise<PassThrough> {
@@ -274,11 +324,43 @@ export class KimiStreamHandler {
 
     stream.once('error', (err: Error) => {
       console.error('[Kimi] Stream error:', err.message)
-      if (!transStream.closed) transStream.end('data: [DONE]\n\n')
+      if (!transStream.closed) {
+        // Flush tool call buffer before ending
+        const baseChunk = createBaseChunk(this.conversationId, this.model, created)
+        const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'kimi')
+        for (const outChunk of flushChunks) {
+          transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+        }
+        const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+        transStream.write(`data: ${JSON.stringify({
+          id: this.conversationId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          created,
+        })}\n\n`)
+        transStream.end('data: [DONE]\n\n')
+      }
     })
 
     stream.once('close', () => {
-      if (!transStream.closed) transStream.end('data: [DONE]\n\n')
+      if (!transStream.closed) {
+        // Flush tool call buffer before ending
+        const baseChunk = createBaseChunk(this.conversationId, this.model, created)
+        const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'kimi')
+        for (const outChunk of flushChunks) {
+          transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+        }
+        const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+        transStream.write(`data: ${JSON.stringify({
+          id: this.conversationId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          created,
+        })}\n\n`)
+        transStream.end('data: [DONE]\n\n')
+      }
     })
 
     return transStream
@@ -377,11 +459,21 @@ export class KimiStreamHandler {
 
     // Handle completion
     if (data.done !== undefined) {
+      // Flush any remaining tool call buffer
+      const baseChunk = createBaseChunk(this.conversationId, this.model, created)
+      const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'kimi')
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+      
+      // Determine finish_reason based on whether we had tool calls
+      const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+      
       transStream.write(`data: ${JSON.stringify({
         id: this.conversationId,
         model: this.model,
         object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
         created,
       })}\n\n`)
       transStream.end('data: [DONE]\n\n')
@@ -389,13 +481,27 @@ export class KimiStreamHandler {
   }
 
   private sendChunk(transStream: PassThrough, content: string, created: number) {
-    transStream.write(`data: ${JSON.stringify({
-      id: this.conversationId,
-      model: this.model,
-      object: 'chat.completion.chunk',
-      choices: [{ index: 0, delta: { content }, finish_reason: null }],
-      created,
-    })}\n\n`)
+    // Process tool call interception
+    const baseChunk = createBaseChunk(this.conversationId, this.model, created)
+    const { chunks: outputChunks } = processStreamContent(
+      content, 
+      this.toolCallState, 
+      baseChunk, 
+      false,
+      'kimi'
+    )
+    
+    // Check if we emitted tool calls first
+    const hasToolCalls = outputChunks.some(c => c.choices?.[0]?.delta?.tool_calls)
+    
+    for (const outChunk of outputChunks) {
+      transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+    }
+    
+    // If we emitted tool calls, skip regular content output
+    if (hasToolCalls) {
+      // Tool calls emitted, skipping regular content
+    }
   }
 
   async handleNonStream(stream: any): Promise<any> {
@@ -439,6 +545,9 @@ export class KimiStreamHandler {
               }
 
               if (data.done !== undefined) {
+                const { parseToolCallsFromText } = require('../utils/toolParser')
+                const { content: cleanContent, toolCalls } = parseToolCallsFromText(content, 'kimi')
+
                 resolve({
                   id: this.conversationId,
                   model: this.model,
@@ -446,8 +555,12 @@ export class KimiStreamHandler {
                   created,
                   choices: [{
                     index: 0,
-                    message: { role: 'assistant', content },
-                    finish_reason: 'stop',
+                    message: { 
+                      role: 'assistant', 
+                      content: toolCalls.length > 0 ? null : cleanContent.trim(),
+                      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+                    },
+                    finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
                   }],
                   usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
                 })
@@ -465,6 +578,9 @@ export class KimiStreamHandler {
 
       stream.once('error', reject)
       stream.once('close', () => {
+        const { parseToolCallsFromText } = require('../utils/toolParser')
+        const { content: cleanContent, toolCalls } = parseToolCallsFromText(content, 'kimi')
+
         resolve({
           id: this.conversationId,
           model: this.model,
@@ -472,8 +588,12 @@ export class KimiStreamHandler {
           created,
           choices: [{
             index: 0,
-            message: { role: 'assistant', content },
-            finish_reason: 'stop',
+            message: { 
+              role: 'assistant', 
+              content: toolCalls.length > 0 ? null : cleanContent.trim(),
+              ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {})
+            },
+            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
           }],
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
         })

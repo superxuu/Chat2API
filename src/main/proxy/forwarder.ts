@@ -203,6 +203,8 @@ export class RequestForwarder {
         messages: request.messages as any,
         stream: request.stream,
         temperature: request.temperature,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -298,6 +300,8 @@ export class RequestForwarder {
         web_search: request.web_search,
         reasoning_effort: request.reasoning_effort,
         deep_research: request.deep_research,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -395,6 +399,8 @@ export class RequestForwarder {
         temperature: request.temperature,
         enableThinking: !!request.reasoning_effort,
         enableWebSearch: !!request.web_search,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -460,6 +466,8 @@ export class RequestForwarder {
         messages: request.messages as any,
         stream: request.stream,
         temperature: request.temperature,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -541,6 +549,8 @@ export class RequestForwarder {
         stream: request.stream,
         temperature: request.temperature,
         enable_thinking: !!request.reasoning_effort,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -625,6 +635,8 @@ export class RequestForwarder {
         temperature: request.temperature,
         web_search: request.web_search,
         reasoning_effort: request.reasoning_effort,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -707,6 +719,8 @@ export class RequestForwarder {
         messages: request.messages as any,
         stream: request.stream,
         temperature: request.temperature,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
       })
 
       const latency = Date.now() - startTime
@@ -875,6 +889,15 @@ export class RequestForwarder {
 
     if (request.user !== undefined) {
       body.user = request.user
+    }
+
+    // Pass through tools and tool_choice for function calling
+    if (request.tools !== undefined && request.tools.length > 0) {
+      body.tools = request.tools
+    }
+
+    if (request.tool_choice !== undefined) {
+      body.tool_choice = request.tool_choice
     }
 
     return body

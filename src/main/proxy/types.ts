@@ -7,9 +7,45 @@
  * OpenAI Message Format
  */
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string | ChatMessageContent[]
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string | ChatMessageContent[] | null
   name?: string
+  tool_call_id?: string
+  tool_calls?: ChatCompletionMessageToolCall[]
+}
+
+/**
+ * Tool Call Function
+ */
+export interface ChatCompletionMessageToolCall {
+  id: string
+  type: 'function'
+  function: {
+    name: string
+    arguments: string
+  }
+}
+
+/**
+ * Tool Definition
+ */
+export interface ChatCompletionTool {
+  type: 'function'
+  function: {
+    name: string
+    description?: string
+    parameters?: Record<string, any>
+  }
+}
+
+/**
+ * Tool Choice
+ */
+export type ChatCompletionToolChoice = 'none' | 'auto' | {
+  type: 'function'
+  function: {
+    name: string
+  }
 }
 
 /**
@@ -58,6 +94,10 @@ export interface ChatCompletionRequest {
   reasoning_effort?: 'low' | 'medium' | 'high'
   /** Enable deep research mode (GLM specific) */
   deep_research?: boolean
+  /** Tools for function calling */
+  tools?: ChatCompletionTool[]
+  /** Tool choice */
+  tool_choice?: ChatCompletionToolChoice
 }
 
 /**
@@ -83,15 +123,18 @@ export interface ChatCompletionChoice {
   index: number
   message?: {
     role: 'assistant'
-    content: string
+    content: string | null
     reasoning_content?: string
+    tool_calls?: ChatCompletionMessageToolCall[]
   }
   delta?: {
     role?: 'assistant'
     content?: string
     reasoning_content?: string
+    tool_calls?: ChatCompletionMessageToolCall[]
   }
-  finish_reason: 'stop' | 'length' | 'content_filter' | null
+  finish_reason: 'stop' | 'length' | 'content_filter' | 'tool_calls' | null
+  logprobs?: any
 }
 
 /**

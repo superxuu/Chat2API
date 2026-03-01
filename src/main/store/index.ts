@@ -7,7 +7,8 @@
 export * from './types'
 
 // Core storage
-export { storeManager, StoreManager } from './store'
+import { storeManager, StoreManager } from './store'
+export { storeManager, StoreManager }
 
 // Account management API
 export { AccountManager } from './accounts'

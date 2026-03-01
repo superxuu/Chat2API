@@ -11,6 +11,14 @@ import crypto from 'crypto'
 import { createParser, EventSourceMessage } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
+import { toolsToSystemPrompt, TOOL_WRAP_HINT } from '../utils/tools'
+import { 
+  createToolCallState, 
+  processStreamContent, 
+  flushToolCallBuffer,
+  createBaseChunk,
+  ToolCallState 
+} from '../utils/streamToolHandler'
 
 const AGENT_BASE_URL = 'https://agent.minimaxi.com'
 
@@ -52,8 +60,10 @@ const FAKE_USER_DATA: Record<string, any> = {
 }
 
 interface MiniMaxMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string | any[]
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string | any[] | null
+  tool_call_id?: string
+  tool_calls?: any[]
 }
 
 interface ChatCompletionRequest {
@@ -61,6 +71,8 @@ interface ChatCompletionRequest {
   messages: MiniMaxMessage[]
   stream?: boolean
   temperature?: number
+  tools?: any[]
+  tool_choice?: any
 }
 
 interface DeviceInfo {
@@ -401,15 +413,35 @@ export class MiniMaxAdapter {
   }
 
   private messagesPrepare(messages: MiniMaxMessage[]): any {
+    // Process messages including tool calls and tool responses
+    const processedMessages = messages.map(msg => {
+      // Handle tool calls in assistant message
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const toolCallsText = msg.tool_calls.map(tc => {
+          return `[call:${tc.function.name}]${tc.function.arguments}[/call]`
+        }).join('\n')
+        return { ...msg, content: `[function_calls]\n${toolCallsText}\n[/function_calls]` }
+      }
+      // Handle tool response message
+      if (msg.role === 'tool' && msg.tool_call_id) {
+        return { 
+          ...msg, 
+          role: 'user' as const,
+          content: `[TOOL_RESULT for ${msg.tool_call_id}] ${msg.content || ''}` 
+        }
+      }
+      return msg
+    })
+
     let content = ''
     
-    if (messages.length < 2) {
-      content = messages.reduce((acc, msg) => {
+    if (processedMessages.length < 2) {
+      content = processedMessages.reduce((acc, msg) => {
         const text = typeof msg.content === 'string' ? msg.content : ''
         return acc + `${text}\n`
       }, '')
     } else {
-      const latestMessage = messages[messages.length - 1]
+      const latestMessage = processedMessages[processedMessages.length - 1]
       const hasFileOrImage = Array.isArray(latestMessage.content) &&
         latestMessage.content.some((v: any) => typeof v === 'object' && ['file', 'image_url'].includes(v.type))
       
@@ -418,10 +450,10 @@ export class MiniMaxAdapter {
           content: '关注用户最新发送文件和消息',
           role: 'system',
         }
-        messages = [...messages.slice(0, -1), newFileMessage, messages[messages.length - 1]]
+        processedMessages.splice(processedMessages.length - 1, 0, newFileMessage)
       }
       
-      content = messages.reduce((acc, msg) => {
+      content = processedMessages.reduce((acc, msg) => {
         const text = typeof msg.content === 'string' ? msg.content : ''
         return acc + `${msg.role}:${text}\n`
       }, '') + 'assistant:\n'
@@ -448,7 +480,23 @@ export class MiniMaxAdapter {
     this.created = unixTimestamp()
     
     const deviceInfo = await this.requestDeviceInfo()
-    const requestBody = this.messagesPrepare(request.messages)
+
+    // Clone messages to avoid modifying original request
+    const messages = [...request.messages]
+
+    const requestBody = this.messagesPrepare(messages)
+
+    // Inject tools definition into prompt if tools are provided
+    if (request.tools && request.tools.length > 0) {
+      // Use simple prompt for MiniMax to avoid confusion with prefixes
+      const toolsPrompt = toolsToSystemPrompt(request.tools, true)
+      const reinforcement = `
+IMPORTANT: You must output the tool arguments as a valid JSON object.
+Do NOT output the file content directly after the tool name.
+Example: [call:write_to_file]{"filePath": "test.py", "content": "print('hello')"}[/call]
+`
+      requestBody.text = `${toolsPrompt}\n${reinforcement}\n\n${requestBody.text}`
+    }
     
     // Step 1: Send message
     const sendResponse = await this.request('POST', '/matrix/api/v1/chat/send_msg', requestBody, deviceInfo)
@@ -548,6 +596,7 @@ export class MiniMaxAdapter {
     let pollCount = 0
     const maxPolls = 60
     const pollInterval = 500
+    const toolCallState = createToolCallState()
     
     // Send initial chunk
     transStream.write(
@@ -582,21 +631,35 @@ export class MiniMaxAdapter {
             // Send new content
             if (currentContent.length > lastContent.length) {
               const newChunk = currentContent.substring(lastContent.length)
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: chatId.toString(),
-                  model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: newChunk }, finish_reason: null }],
-                  created,
-                })}\n\n`
-              )
               lastContent = currentContent
+              
+              // Process tool call interception
+              const baseChunk = createBaseChunk(chatId.toString(), model, created)
+              const { chunks: outputChunks } = processStreamContent(
+                newChunk, 
+                toolCallState, 
+                baseChunk, 
+                false,
+                'minimax'
+              )
+              
+              for (const outChunk of outputChunks) {
+                transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+              }
             }
             
             // Check if complete (content stopped growing)
             if (pollCount > 5 && currentContent === lastContent && lastContent.length > 0) {
               console.log('[MiniMax] Stream completed after', pollCount, 'polls')
+              
+              // Flush tool call buffer before finishing
+              const baseChunk = createBaseChunk(chatId.toString(), model, created)
+              const flushChunks = flushToolCallBuffer(toolCallState, baseChunk, 'minimax')
+              for (const outChunk of flushChunks) {
+                transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+              }
+              
+              const finishReason = toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
               
               // Send finish chunk
               transStream.write(
@@ -604,7 +667,7 @@ export class MiniMaxAdapter {
                   id: chatId.toString(),
                   model,
                   object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                  choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
                   created,
                 })}\n\n`
               )
@@ -685,11 +748,13 @@ export class MiniMaxStreamHandler {
   private model: string
   private created: number
   private onEnd?: (chatId: string) => void
+  private toolCallState: ToolCallState
 
   constructor(model: string, onEnd?: (chatId: string) => void) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
+    this.toolCallState = createToolCallState()
   }
 
   setChatId(chatId: string) {
@@ -757,12 +822,22 @@ export class MiniMaxStreamHandler {
           const { type, base_resp, statusInfo, data: _data } = result
 
           if (type === 8) {
+            // Flush tool call buffer before finishing
+            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+            const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+            for (const outChunk of flushChunks) {
+              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+            }
+            
+            // Determine finish_reason based on whether we had tool calls
+            const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+            
             transStream.write(
               `data: ${JSON.stringify({
                 id: this.chatId,
                 model: this.model,
                 object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
                 created: this.created,
               })}\n\n`
             )
@@ -786,27 +861,42 @@ export class MiniMaxStreamHandler {
 
             if (!this.chatId && finalChatId) this.chatId = finalChatId
 
-            const exceptCharIndex = text.indexOf('')
-            const chunk = text.substring(
-              exceptCharIndex !== -1
-                ? Math.min(content.length, exceptCharIndex)
-                : content.length,
-              exceptCharIndex === -1 ? text.length : exceptCharIndex
-            )
-            content += chunk
+            // text contains the full accumulated content so far
+            // content contains what we have processed so far
+            const chunk = text.length > content.length ? text.substring(content.length) : ''
+            content = text
 
             console.log('[MiniMax] Stream chunk:', chunk.substring(0, 50), 'isEnd:', isEnd)
 
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: chunk }, finish_reason: isEnd === 0 ? 'stop' : null }],
-                created: this.created,
-              })}\n\n`
+            // Process tool call interception
+            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+            const { chunks: outputChunks } = processStreamContent(
+              chunk, 
+              this.toolCallState, 
+              baseChunk, 
+              false,
+              'minimax'
             )
+            
+            // Check if we emitted tool calls first
+            const hasToolCalls = outputChunks.some(c => c.choices?.[0]?.delta?.tool_calls)
+            
+            for (const outChunk of outputChunks) {
+              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+            }
+            
+              // If we emitted tool calls, skip regular content output
+              if (hasToolCalls) {
+                // Tool calls emitted, skipping regular content
+              }
+
             if (isEnd === 0) {
+              // Flush tool call buffer before finishing
+              const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+              for (const outChunk of flushChunks) {
+                transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+              }
+              
               transStream.end('data: [DONE]\n\n')
               if (this.onEnd) this.onEnd(this.chatId)
             }
@@ -850,12 +940,22 @@ export class MiniMaxStreamHandler {
 
             // Handle type 8 (end of stream)
             if (type === 8) {
+              // Flush tool call buffer before finishing
+              const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+              const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+              for (const outChunk of flushChunks) {
+                transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+              }
+              
+              // Determine finish_reason based on whether we had tool calls
+              const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+              
               transStream.write(
                 `data: ${JSON.stringify({
                   id: this.chatId,
                   model: this.model,
                   object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                  choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
                   created: this.created,
                 })}\n\n`
               )
@@ -882,28 +982,42 @@ export class MiniMaxStreamHandler {
 
               if (!this.chatId && finalChatId) this.chatId = finalChatId
 
-              const exceptCharIndex = text.indexOf('')
-              const chunk = text.substring(
-                exceptCharIndex !== -1
-                  ? Math.min(content.length, exceptCharIndex)
-                  : content.length,
-                exceptCharIndex === -1 ? text.length : exceptCharIndex
-              )
-              content += chunk
+              // text contains the full accumulated content so far
+              // content contains what we have processed so far
+              const chunk = text.length > content.length ? text.substring(content.length) : ''
+              content = text
 
               console.log('[MiniMax] Stream chunk:', chunk.substring(0, 50), 'isEnd:', isEnd)
 
-              transStream.write(
-                `data: ${JSON.stringify({
-                  id: this.chatId,
-                  model: this.model,
-                  object: 'chat.completion.chunk',
-                  choices: [{ index: 0, delta: { content: chunk }, finish_reason: isEnd === 0 ? 'stop' : null }],
-                  created: this.created,
-                })}\n\n`
-              )
+            // Process tool call interception
+            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+            const { chunks: outputChunks } = processStreamContent(
+              chunk, 
+              this.toolCallState, 
+              baseChunk, 
+              false,
+              'minimax'
+            )
+              
+              // Check if we emitted tool calls first
+              const hasToolCalls = outputChunks.some(c => c.choices?.[0]?.delta?.tool_calls)
+              
+              for (const outChunk of outputChunks) {
+                transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+              }
+              
+              // If we emitted tool calls, skip regular content output
+              if (hasToolCalls) {
+                // Tool calls emitted, skipping regular content
+              }
 
               if (isEnd === 0) {
+                // Flush tool call buffer before finishing
+                const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+                for (const outChunk of flushChunks) {
+                  transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+                }
+                
                 transStream.end('data: [DONE]\n\n')
                 if (this.onEnd) this.onEnd(this.chatId)
               }
@@ -918,6 +1032,20 @@ export class MiniMaxStreamHandler {
 
     stream.once('error', (err: Error) => {
       console.error('[MiniMax] Stream error:', err)
+      // Flush tool call buffer before ending
+      const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+      const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+      const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+      transStream.write(`data: ${JSON.stringify({
+        id: this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        created: this.created,
+      })}\n\n`)
       transStream.emit('error', err)
       transStream.end()
     })
@@ -935,6 +1063,20 @@ export class MiniMaxStreamHandler {
       }
       // Only end gracefully if we received data successfully
       if (hasReceivedData || (httpStatus && httpStatus < 400)) {
+        // Flush tool call buffer before ending
+        const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+        const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'minimax')
+        for (const outChunk of flushChunks) {
+          transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+        }
+        const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+        transStream.write(`data: ${JSON.stringify({
+          id: this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          created: this.created,
+        })}\n\n`)
         transStream.end('data: [DONE]\n\n')
       }
     })
@@ -970,7 +1112,17 @@ export class MiniMaxStreamHandler {
               const finalChatId = chat_id || chatID
               if (!data.id && finalChatId) data.id = finalChatId
               if (isEnd !== 0 && text) data.choices[0].message.content += text
-              if (isEnd === 0) resolve(data)
+              if (isEnd === 0) {
+                const { parseToolCallsFromText } = require('../utils/toolParser')
+                const { content: cleanContent, toolCalls } = parseToolCallsFromText(data.choices[0].message.content, 'minimax')
+                
+                if (toolCalls.length > 0) {
+                  data.choices[0].message.content = cleanContent.trim() || null
+                  ;(data.choices[0].message as any).tool_calls = toolCalls
+                  data.choices[0].finish_reason = 'tool_calls'
+                }
+                resolve(data)
+              }
             }
           } catch (err) {
             reject(err)
@@ -980,7 +1132,17 @@ export class MiniMaxStreamHandler {
 
       response.data.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
       response.data.once('error', reject)
-      response.data.once('close', () => resolve(data))
+      response.data.once('close', () => {
+        const { parseToolCallsFromText } = require('../utils/toolParser')
+        const { content: cleanContent, toolCalls } = parseToolCallsFromText(data.choices[0].message.content, 'minimax')
+        
+        if (toolCalls.length > 0) {
+          data.choices[0].message.content = cleanContent.trim() || null
+          ;(data.choices[0].message as any).tool_calls = toolCalls
+          data.choices[0].finish_reason = 'tool_calls'
+        }
+        resolve(data)
+      })
     })
   }
 }

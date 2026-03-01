@@ -31,7 +31,7 @@ type StoreType = any
  * Storage Manager Class
  * Responsible for data persistence and encryption
  */
-class StoreManager {
+export class StoreManager {
   private store: StoreType | null = null
   private isInitialized: boolean = false
   private mainWindow: BrowserWindow | null = null
@@ -61,7 +61,6 @@ class StoreManager {
       name: 'data',
       cwd: storagePath,
       defaults: this.getDefaultData(),
-      encryptionKey: this.getEncryptionKey(),
     })
 
     await this.initializeDefaultProviders()

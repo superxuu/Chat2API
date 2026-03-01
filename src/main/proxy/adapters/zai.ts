@@ -9,6 +9,14 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import FormData from 'form-data'
 import { Account, Provider } from '../../store/types'
+import { toolsToSystemPrompt, TOOL_WRAP_HINT } from '../utils/tools'
+import { 
+  createToolCallState, 
+  processStreamContent, 
+  flushToolCallBuffer,
+  createBaseChunk,
+  ToolCallState 
+} from '../utils/streamToolHandler'
 
 const ZAI_API_BASE = 'https://chat.z.ai'
 const X_FE_VERSION = 'prod-fe-1.0.241'
@@ -31,8 +39,10 @@ const FAKE_HEADERS = {
 }
 
 interface ZaiMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string | any[]
+  role: 'user' | 'assistant' | 'system' | 'tool'
+  content: string | any[] | null
+  tool_call_id?: string
+  tool_calls?: any[]
 }
 
 interface ChatCompletionRequest {
@@ -42,6 +52,8 @@ interface ChatCompletionRequest {
   temperature?: number
   web_search?: boolean
   reasoning_effort?: 'low' | 'medium' | 'high'
+  tools?: any[]
+  tool_choice?: any
 }
 
 function uuid(separator: boolean = true): string {
@@ -262,7 +274,48 @@ export class ZaiAdapter {
     
     console.log('[Z.ai] Original model:', request.model, '-> Mapped model:', mappedModel)
     
-    const signaturePrompt = this.extractLastUserMessage(request.messages)
+    // Clone messages to avoid modifying original request
+    let messages = [...request.messages]
+
+    // Process messages including tool calls and tool responses
+    messages = messages.map(msg => {
+      // Handle tool calls in assistant message
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        const toolCallsText = msg.tool_calls.map(tc => {
+          return `[call:${tc.function.name}]${tc.function.arguments}[/call]`
+        }).join('\n')
+        return { ...msg, content: `[function_calls]\n${toolCallsText}\n[/function_calls]`, tool_calls: undefined }
+      }
+      // Handle tool response message
+      if (msg.role === 'tool' && msg.tool_call_id) {
+        return { 
+          ...msg, 
+          role: 'user' as const,
+          content: `[TOOL_RESULT for ${msg.tool_call_id}] ${msg.content || ''}`,
+          tool_call_id: undefined
+        }
+      }
+      return msg
+    })
+    
+    // Inject tools definition into prompt if tools are provided
+    if (request.tools && request.tools.length > 0) {
+      // Use simple prompt for Z.ai to avoid confusion with prefixes
+      const toolsPrompt = toolsToSystemPrompt(request.tools, true)
+      // Find the first user message or system message to inject tools
+      const firstMsg = messages.find(m => m.role === 'user' || m.role === 'system')
+      if (firstMsg) {
+        if (typeof firstMsg.content === 'string') {
+          firstMsg.content = `${toolsPrompt}\n\n${firstMsg.content}`
+        } else if (Array.isArray(firstMsg.content)) {
+          firstMsg.content.unshift({ type: 'text', text: toolsPrompt })
+        }
+      } else {
+        messages.unshift({ role: 'system', content: toolsPrompt })
+      }
+    }
+
+    const signaturePrompt = this.extractLastUserMessage(messages)
     const { chatId, messageId } = await this.createChat(mappedModel, signaturePrompt)
     const requestId = uuid()
     const timestamp = Date.now()
@@ -280,7 +333,7 @@ export class ZaiAdapter {
     const requestBody = {
       stream: request.stream !== false,
       model: mappedModel,
-      messages: request.messages,
+      messages: messages,
       signature_prompt: signaturePrompt,
       params: {},
       extra: {},
@@ -415,11 +468,13 @@ export class ZaiStreamHandler {
   private model: string
   private created: number
   private onEnd?: (chatId: string) => void
+  private toolCallState: ToolCallState
 
   constructor(model: string, onEnd?: (chatId: string) => void) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
+    this.toolCallState = createToolCallState()
   }
 
   async handleStream(stream: any): Promise<PassThrough> {
@@ -452,26 +507,49 @@ export class ZaiStreamHandler {
 
           if (result.phase === 'answer' && result.delta_content) {
             content += result.delta_content
-            transStream.write(
-              `data: ${JSON.stringify({
-                id: this.chatId,
-                model: this.model,
-                object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: { content: result.delta_content }, finish_reason: null }],
-                created: this.created,
-              })}\n\n`
+            
+            // Process tool call interception
+            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+            const { chunks: outputChunks } = processStreamContent(
+              result.delta_content, 
+              this.toolCallState, 
+              baseChunk, 
+              false,
+              'zai'
             )
+            
+            // Check if we emitted tool calls first
+            const hasToolCalls = outputChunks.some(c => c.choices?.[0]?.delta?.tool_calls)
+            
+            for (const outChunk of outputChunks) {
+              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+            }
+            
+            // If we emitted tool calls, skip regular content output
+            if (hasToolCalls) {
+              // Tool calls emitted, skipping regular content
+            }
           } else if (result.phase === 'done' && result.done) {
             console.log('[Z.ai] Stream finished, content length:', content.length)
             
+            // Flush tool call buffer before finishing
+            const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+            const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'zai')
+            for (const outChunk of flushChunks) {
+              transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+            }
+            
             const usage = result.usage || { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+            
+            // Determine finish_reason based on whether we had tool calls
+            const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
             
             transStream.write(
               `data: ${JSON.stringify({
                 id: this.chatId,
                 model: this.model,
                 object: 'chat.completion.chunk',
-                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
                 usage,
                 created: this.created,
               })}\n\n`
@@ -507,10 +585,38 @@ export class ZaiStreamHandler {
     stream.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
     stream.once('error', (err: Error) => {
       console.error('[Z.ai] Stream error:', err)
+      // Flush tool call buffer before ending
+      const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+      const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'zai')
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+      const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+      transStream.write(`data: ${JSON.stringify({
+        id: this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        created: this.created,
+      })}\n\n`)
       transStream.end('data: [DONE]\n\n')
     })
     stream.once('close', () => {
       console.log('[Z.ai] Stream closed')
+      // Flush tool call buffer before ending
+      const baseChunk = createBaseChunk(this.chatId, this.model, this.created)
+      const flushChunks = flushToolCallBuffer(this.toolCallState, baseChunk, 'zai')
+      for (const outChunk of flushChunks) {
+        transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
+      }
+      const finishReason = this.toolCallState.hasEmittedToolCall ? 'tool_calls' : 'stop'
+      transStream.write(`data: ${JSON.stringify({
+        id: this.chatId,
+        model: this.model,
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        created: this.created,
+      })}\n\n`)
       transStream.end('data: [DONE]\n\n')
     })
 
@@ -550,12 +656,22 @@ export class ZaiStreamHandler {
 
             if (result.phase === 'answer' && result.delta_content) {
               data.choices[0].message.content += result.delta_content
-            } else if (result.phase === 'done' && result.done) {
-              console.log('[Z.ai] Non-stream finished, content length:', data.choices[0].message.content.length)
-              if (result.usage) {
-                data.usage = result.usage
-              }
-              resolve(data)
+          } else if (result.phase === 'done' && result.done) {
+            console.log('[Z.ai] Non-stream finished, content length:', data.choices[0].message.content.length)
+            if (result.usage) {
+              data.usage = result.usage
+            }
+            
+            const { parseToolCallsFromText } = require('../utils/toolParser')
+            const { content: cleanContent, toolCalls } = parseToolCallsFromText(data.choices[0].message.content, 'zai')
+            
+            if (toolCalls.length > 0) {
+              data.choices[0].message.content = cleanContent.trim() || null
+              ;(data.choices[0].message as any).tool_calls = toolCalls
+              data.choices[0].finish_reason = 'tool_calls'
+            }
+            
+            resolve(data)
             } else if (result.error || eventData.error) {
               const error = result.error || eventData.error
               data.choices[0].message.content += `\nError: ${error.detail || JSON.stringify(error)}`
@@ -570,7 +686,18 @@ export class ZaiStreamHandler {
 
       response.data.on('data', (buffer: Buffer) => parser.feed(buffer.toString()))
       response.data.once('error', reject)
-      response.data.once('close', () => resolve(data))
+      response.data.once('close', () => {
+        const { parseToolCallsFromText } = require('../utils/toolParser')
+        const { content: cleanContent, toolCalls } = parseToolCallsFromText(data.choices[0].message.content, 'zai')
+        
+        if (toolCalls.length > 0) {
+          data.choices[0].message.content = cleanContent.trim() || null
+          ;(data.choices[0].message as any).tool_calls = toolCalls
+          data.choices[0].finish_reason = 'tool_calls'
+        }
+        
+        resolve(data)
+      })
     })
   }
 

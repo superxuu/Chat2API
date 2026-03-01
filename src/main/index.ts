@@ -1,8 +1,29 @@
 import { app, BrowserWindow } from 'electron'
 import { join } from 'path'
+import { homedir } from 'os'
+import { writeFileSync, appendFileSync } from 'fs'
 import { createWindow, getMainWindow, loadUrl, loadFile, openDevTools } from './window/manager'
 import { createTray, updateTrayIcon, destroyTray } from './tray'
 import { registerIpcHandlers } from './ipc/handlers'
+import { initializeStore } from './store'
+
+// Simple file logger for debugging startup issues
+const logPath = join(homedir(), 'chat2api_startup.log')
+function log(message: string) {
+  try {
+    const timestamp = new Date().toISOString()
+    appendFileSync(logPath, `[${timestamp}] ${message}\n`)
+  } catch (e) {
+    // ignore
+  }
+}
+
+// Clear log on startup
+try {
+  writeFileSync(logPath, '')
+} catch (e) {}
+
+log('App starting...')
 
 // Automatically add --no-sandbox flag when running as root user
 if (process.getuid && process.getuid() === 0) {
@@ -36,7 +57,20 @@ if (!gotTheLock) {
 
 async function initializeApp(): Promise<void> {
   app.on('ready', async () => {
-    await setupApp()
+    log('App ready event received')
+    try {
+      // Initialize store before doing anything else
+      log('Initializing store...')
+      await initializeStore()
+      log('Store initialized')
+      
+      log('Setting up app...')
+      await setupApp()
+      log('App setup complete')
+    } catch (error) {
+      log(`Failed to initialize app: ${error}`)
+      console.error('Failed to initialize app:', error)
+    }
   })
 
   app.on('window-all-closed', () => {
@@ -65,13 +99,15 @@ async function initializeApp(): Promise<void> {
 }
 
 async function setupApp(): Promise<void> {
+  const isDev = process.env.NODE_ENV === 'development'
+  
   const mainWindow = createWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 600,
     title: 'Chat2API',
-    show: false,
+    show: true, // Force show window to debug
   })
 
   await registerIpcHandlers(mainWindow)
@@ -80,7 +116,7 @@ async function setupApp(): Promise<void> {
 
   await loadAppContent(mainWindow)
 
-  if (process.env.NODE_ENV === 'development') {
+  if (isDev) {
     openDevTools()
   }
 }
