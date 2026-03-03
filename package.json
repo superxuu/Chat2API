@@ -174,6 +174,12 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.ico",
@@ -194,6 +200,9 @@
     },
     "portable": {
       "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    },
+    "zip": {
+      "artifactName": "${productName}-${version}-${arch}-portable.zip"
     },
     "linux": {
       "target": [
